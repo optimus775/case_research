@@ -72,21 +72,22 @@ class RasScraper:
 
     async def apply_filters(self, page: Page, q: RasQuery):
         logger = logging.getLogger(__name__)
-        # Try to locate the search textbox/textarea robustly
+        # Try to locate the search textbox/textarea robustly (prefer textarea)
         filled = False
-        try:
-            # Standard placeholder-based fill
-            await self._safe_fill(page, self.SEL_INPUT_TEXT, q.text)
-            filled = True
-        except Exception:
-            pass
-        if not filled and q.text:
+        if q.text:
             try:
                 el = await page.query_selector(self.SEL_TEXTAREA_TEXT)
                 if el:
                     await el.fill(q.text)
                     filled = True
                     logger.debug("Filled textarea by placeholder")
+            except Exception:
+                pass
+        if not filled and q.text:
+            try:
+                # Standard placeholder-based input fill (fallback)
+                await self._safe_fill(page, self.SEL_INPUT_TEXT, q.text)
+                filled = True
             except Exception:
                 pass
         if not filled and q.text:
