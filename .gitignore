@@ -68,3 +68,7 @@ tmp/
 temp/
 
 .langgraph_api
+
+# Local debug artifacts
+debug_*.html
+debug_*.js

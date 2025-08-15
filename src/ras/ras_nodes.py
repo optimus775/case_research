@@ -5,6 +5,7 @@
 from __future__ import annotations
 import os
 import asyncio
+import logging
 from typing import List
 from .models import RasQuery, RasListingItem, RasRawDoc
 from .browser import RasBrowser
@@ -42,6 +43,8 @@ async def ras_listings_node(state):
         return [raw]
 
     queries: List[RasQuery] = _normalize(state.get("queries") or state.get("query"))
+    logger = logging.getLogger(__name__)
+    logger.debug("ras_listings_node: %d queries", len(queries))
 
     if not queries:
         state["ras_listings"] = []
@@ -58,9 +61,10 @@ async def ras_listings_node(state):
                 await scraper.open_search(page)
                 batch = await scraper.collect_listings(page, q, limit=q.per_page)
                 listings_acc.extend(batch)
-            except Exception:
+                logger.debug("Listings batch for '%s': %d", q.text or q.case_number, len(batch))
+            except Exception as e:
                 # continue on error per query
-                pass
+                logger.exception("ras_listings_node error for query %s: %s", q.model_dump(), e)
         await ctx.close()
 
     # Deduplicate
@@ -71,12 +75,15 @@ async def ras_listings_node(state):
             seen.add(key)
             out.append(it)
 
+    logger.debug("ras_listings_node: total unique listings=%d", len(out))
     state["ras_listings"] = out
     return state
 
 
 async def ras_fetch_docs_node(state):
     listings: List[RasListingItem] = state.get("ras_listings", [])
+    logger = logging.getLogger(__name__)
+    logger.debug("ras_fetch_docs_node: input listings=%d", len(listings))
     if not listings:
         state["ras_docs"] = []
         return state
@@ -102,11 +109,12 @@ async def ras_fetch_docs_node(state):
                 doc = await dl.fetch_and_parse(it)
                 if doc and doc.text:
                     docs.append(doc)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Download/parse failed for %s: %s", it.detail_url or it.download_url, e)
 
     await asyncio.gather(*(task(it) for it in listings[:100]))
 
+    logger.debug("ras_fetch_docs_node: docs fetched=%d", len(docs))
     state["ras_docs"] = docs
     return state
 
