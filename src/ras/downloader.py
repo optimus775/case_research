@@ -1,45 +1,70 @@
 # src/ras/downloader.py
-import httpx, asyncio
-from .models import RasListingItem, RasRawDoc
-from pdfminer.high_level import extract_text as pdf_extract_text
+
+from __future__ import annotations
+import asyncio
 from io import BytesIO
+from typing import Optional
+import httpx
+from pdfminer.high_level import extract_text as pdf_extract_text
+from .models import RasListingItem, RasRawDoc
+from .net import async_retryable
+
 
 class RasDownloader:
-    async def fetch_pdf_and_text(self, item: RasListingItem) -> RasRawDoc | None:
-        if not item.detail_url:
-            return None
-        # 1) При необходимости — открыть detail_url через Playwright,
-        #    найти прямую ссылку на файл (download_url).
-        #    Здесь предполагаем, что download_url уже известен.
-        if not item.download_url:
-            return None
+    def __init__(self, user_agent: str | None = None, cookies_header: str | None = None):
+        self.user_agent = user_agent
+        self.cookies_header = cookies_header
 
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.get(item.download_url)
-            resp.raise_for_status()
-            pdf_bytes = resp.content
+    def _headers(self, referer: Optional[str] = None) -> dict:
+        h = {
+            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        if self.user_agent:
+            h["User-Agent"] = self.user_agent
+        if self.cookies_header:
+            h["Cookie"] = self.cookies_header
+        if referer:
+            h["Referer"] = referer
+        return h
 
-        # Быстрый хек: сначала попытка извлечь текст как из PDF,
-        # если текста мало — помечаем как скан и отправляем на OCR.
+    @async_retryable(max_attempts=5)
+    async def fetch_pdf(self, url: str, referer: Optional[str] = None, timeout_s: float = 90.0) -> bytes:
+        async with httpx.AsyncClient(timeout=timeout_s, http2=True, follow_redirects=True) as client:
+            r = await client.get(url, headers=self._headers(referer))
+            r.raise_for_status()
+            return r.content
+
+    async def extract_text(self, pdf_bytes: bytes) -> str:
         text = ""
         try:
             text = pdf_extract_text(BytesIO(pdf_bytes)) or ""
         except Exception:
             text = ""
-
         if len(text.strip()) < 300:
-            # OCR-пайплайн (tesseract/paddleocr) — подключите при необходимости
-            # text = await run_ocr(pdf_bytes, lang="rus")
+            # Optional OCR fallback (implement in ocr.py and import here)
+            # from .ocr import ocr_pdf_bytes
+            # text = await ocr_pdf_bytes(pdf_bytes, lang="rus")
             pass
+        return text
 
+    async def fetch_and_parse(self, item: RasListingItem) -> RasRawDoc | None:
+        if not item.download_url and not item.detail_url:
+            return None
+        url = item.download_url
+        if not url:
+            return None
+        pdf = await self.fetch_pdf(url, referer=item.detail_url)
+        text = await self.extract_text(pdf)
         return RasRawDoc(
-            listing_id=None,
+            listing_id=item.act_id or item.case_id,
             case_number=item.case_number,
             doc_type=item.doc_type,
             date=item.date,
             court=item.court,
             source_url=item.detail_url,
             filename=item.title or "document.pdf",
-            bytes_len=len(pdf_bytes),
-            text=text
+            bytes_len=len(pdf),
+            text=text,
+            meta={"download_url": url},
         )
