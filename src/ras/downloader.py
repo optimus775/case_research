@@ -14,6 +14,7 @@ class RasDownloader:
     def __init__(self, user_agent: str | None = None, cookies_header: str | None = None):
         self.user_agent = user_agent
         self.cookies_header = cookies_header
+        self.http_proxy = os.getenv("RAS_HTTP_PROXY") or os.getenv("RAS_PROXY")
 
     def _headers(self, referer: Optional[str] = None) -> dict:
         h = {
@@ -30,7 +31,12 @@ class RasDownloader:
 
     @async_retryable(max_attempts=5)
     async def fetch_pdf(self, url: str, referer: Optional[str] = None, timeout_s: float = 90.0) -> bytes:
-        async with httpx.AsyncClient(timeout=timeout_s, http2=True, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout_s, 
+            http2=True, 
+            follow_redirects=True,
+            proxies=self.http_proxy
+            ) as client:
             r = await client.get(url, headers=self._headers(referer))
             r.raise_for_status()
             return r.content
