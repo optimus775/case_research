@@ -12,12 +12,23 @@ async def main():
     # Summarize results
     listings = result.get("ras_listings", [])
     docs = result.get("ras_docs", [])
-    print({
+    summary = {
         "listings_count": len(listings),
         "docs_count": len(docs),
         "first_listing": listings[0].model_dump() if listings else None,
-        "first_doc_preview": (docs[0].text[:200] if docs and docs[0].text else None),
-    })
+    }
+    print(summary)
+    # Show a short preview for the first few docs
+    max_preview = 3
+    for i, d in enumerate(docs[:max_preview]):
+        meta = getattr(d, "meta", {}) or {}
+        saved_path = meta.get("saved_path")
+        print(f"doc[{i}]: bytes={d.bytes_len}, saved={saved_path}, url={meta.get('download_url')}")
+        if d.text:
+            snippet = d.text[:400].replace("\n", " ")
+            print(f"doc[{i}] text: {snippet}...")
+        else:
+            print(f"doc[{i}] text: <empty>")
 
 if __name__ == "__main__":
     # Load environment variables from .env (proxy, headless toggle, etc.)

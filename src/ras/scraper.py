@@ -7,6 +7,7 @@ import re
 import logging
 import os
 from datetime import datetime
+from urllib.parse import quote
 from typing import Optional
 import httpx
 from typing import List, Dict, Any, Callable
@@ -203,6 +204,16 @@ class RasScraper:
                 if not detail and act_id:
                     # Fallback to known HtmlDocument route
                     detail = f"{self.BASE}/Ras/HtmlDocument/{act_id}"
+                # Derive direct PDF link when possible: /Kad/PdfDocument/{CaseId}/{Id}/{FileName}
+                derived_pdf = None
+                try:
+                    case_guid = row.get("CaseId") or row.get("CaseID")
+                    doc_guid = row.get("Id") or row.get("DocumentId") or row.get("ActId")
+                    file_name = row.get("FileName") or row.get("Title")
+                    if case_guid and doc_guid and file_name:
+                        derived_pdf = f"{self.BASE}/Kad/PdfDocument/{case_guid}/{doc_guid}/{quote(file_name)}"
+                except Exception:
+                    derived_pdf = None
                 items.append(RasListingItem(
                     act_id=act_id,
                     case_id=row.get("CaseId") or row.get("CaseID"),
@@ -216,7 +227,7 @@ class RasScraper:
                     title=row.get("Title") or row.get("Заголовок") or row.get("FileName"),
                     parties=row.get("Parties") or row.get("Стороны"),
                     detail_url=detail,
-                    download_url=row.get("DownloadUrl"),
+                    download_url=row.get("DownloadUrl") or derived_pdf,
                     extra=row,
                 ))
         return items
@@ -383,6 +394,19 @@ class RasScraper:
                     href = self.BASE + href
                 logger.debug("Resolved PDF via DOM for %s: %s", detail_url, href)
                 return href
+
+        # Heuristic fallback: HtmlDocument route supports '?download=true'
+        try:
+            if "/Ras/HtmlDocument/" in detail_url:
+                fallback = detail_url
+                if not fallback.startswith("http"):
+                    fallback = self.BASE + fallback
+                if not fallback.endswith("?download=true"):
+                    fallback = fallback + ("&download=true" if "?" in fallback else "?download=true")
+                logger.debug("Resolved PDF via fallback for %s: %s", detail_url, fallback)
+                return fallback
+        except Exception:
+            pass
 
         logger.debug("No download URL resolved for %s", detail_url)
         return None

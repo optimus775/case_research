@@ -88,7 +88,7 @@ async def ras_fetch_docs_node(state):
         state["ras_docs"] = []
         return state
 
-    max_conc = int(os.getenv("RAS_MAX_CONCURRENCY", "4"))
+    max_conc = int(os.getenv("RAS_MAX_CONCURRENCY", "2"))
 
     async with RasBrowser() as rb:
         ctx, page, ua = await rb.new_context()
@@ -96,23 +96,25 @@ async def ras_fetch_docs_node(state):
         scraper = RasScraper()
         listings = await scraper.enrich_with_downloads(page, listings, max_items=50)
         cookies_hdr = await rb.cookies_header(ctx, domain_filter="arbitr.ru")
+        dl = RasDownloader(user_agent=ua, cookies_header=cookies_hdr, page=page)
+
+        limiter = RateLimiter(max_conc)
+        docs: List[RasRawDoc] = []
+
+        async def task(it: RasListingItem):
+            async with limiter:
+                try:
+                    doc = await dl.fetch_and_parse(it)
+                    if doc:
+                        if not doc.text:
+                            logger.debug("Empty text for %s; adding doc anyway", it.detail_url or it.download_url)
+                        docs.append(doc)
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    logger.warning("Download/parse failed for %s: %s", it.detail_url or it.download_url, e)
+
+        await asyncio.gather(*(task(it) for it in listings[:50]))
         await ctx.close()
-
-    dl = RasDownloader(user_agent=ua, cookies_header=cookies_hdr)
-
-    limiter = RateLimiter(max_conc)
-    docs: List[RasRawDoc] = []
-
-    async def task(it: RasListingItem):
-        async with limiter:
-            try:
-                doc = await dl.fetch_and_parse(it)
-                if doc and doc.text:
-                    docs.append(doc)
-            except Exception as e:
-                logger.warning("Download/parse failed for %s: %s", it.detail_url or it.download_url, e)
-
-    await asyncio.gather(*(task(it) for it in listings[:100]))
 
     logger.debug("ras_fetch_docs_node: docs fetched=%d", len(docs))
     state["ras_docs"] = docs
