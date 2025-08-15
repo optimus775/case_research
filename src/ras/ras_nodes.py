@@ -21,7 +21,28 @@ from .net import RateLimiter
 
 
 async def ras_listings_node(state):
-    queries: List[RasQuery] = state.get("queries", [])
+    # Accept either 'queries' (list) or 'query' (single RasQuery) in state for compatibility
+    def _normalize(raw) -> List[RasQuery]:
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            out: List[RasQuery] = []
+            for q in raw:
+                if isinstance(q, RasQuery):
+                    out.append(q)
+                elif isinstance(q, dict):
+                    out.append(RasQuery(**q))
+                else:
+                    out.append(q)
+            return out
+        if isinstance(raw, RasQuery):
+            return [raw]
+        if isinstance(raw, dict):
+            return [RasQuery(**raw)]
+        return [raw]
+
+    queries: List[RasQuery] = _normalize(state.get("queries") or state.get("query"))
+
     if not queries:
         state["ras_listings"] = []
         return state

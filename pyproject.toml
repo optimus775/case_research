@@ -44,6 +44,9 @@ dependencies = [
     "mcp>=1.9.4",
     "langchain-aws>=0.2.28",
     "pandas>=2.3.1",
+    "pydantic>=2.0.0",
+    "pdfminer.six>=20221105",
+    "playwright>=1.44.0",
 ]
 
 [project.optional-dependencies]

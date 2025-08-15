@@ -553,12 +553,12 @@ async def get_search_tool(search_api: SearchAPI):
         # Configure Tavily search tool with metadata
         search_tool = tavily_search
         search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
+            **(search_tool.metadata or {}),
+            "type": "search",
             "name": "web_search"
         }
         return [search_tool]
-        
+    
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
         return []

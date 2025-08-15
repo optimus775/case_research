@@ -1,7 +1,7 @@
-# Open Deep Research Repository Overview
+# Судебный ИИ-ассистент Repository Overview
 
 ## Project Description
-Open Deep Research is a configurable, fully open-source deep research agent that works across multiple model providers, search tools, and MCP (Model Context Protocol) servers. It enables automated research with parallel processing and comprehensive report generation.
+Судебный ИИ-ассистент - это настраиваемый, полностью открытый исследовательский агент, который работает с несколькими поставщиками моделей, инструментами поиска и серверами MCP (Model Context Protocol). Он обеспечивает автоматизированное исследование с параллельной обработкой и созданием исчерпывающих отчетов для юристов.
 
 ## Repository Structure
 
@@ -13,13 +13,17 @@ Open Deep Research is a configurable, fully open-source deep research agent that
 - `LICENSE` - MIT license
 - `.env.example` - Environment variables template (not tracked)
 
-### Core Implementation (`src/open_deep_research/`)
-- `deep_researcher.py` - Main LangGraph implementation (entry point: `deep_researcher`)
-- `configuration.py` - Configuration management and settings
-- `state.py` - Graph state definitions and data structures  
-- `prompts.py` - System prompts and prompt templates
-- `utils.py` - Utility functions and helpers
-- `files/` - Research output and example files
+### Core Implementation (`src/`)
+- `open_deep_research/` - The original deep research agent implementation.
+- `ras/` - A module for scraping court decisions from ras.arbitr.ru.
+  - `browser.py` - Manages Playwright browser automation.
+  - `downloader.py` - Downloads and parses PDF documents.
+  - `models.py` - Pydantic models for queries, listings, and documents.
+  - `net.py` - Network utilities, including a rate limiter.
+  - `ocr.py` - Optional OCR functionality.
+  - `ras_nodes.py` - LangGraph nodes for the `ras` module.
+  - `scraper.py` - The core scraping logic.
+- `security/` - Security-related components.
 
 ### Legacy Implementations (`src/legacy/`)
 Contains two earlier research implementations:
@@ -28,9 +32,6 @@ Contains two earlier research implementations:
 - `legacy.md` - Documentation for legacy implementations
 - `CLAUDE.md` - Legacy-specific Claude instructions
 - `tests/` - Legacy-specific tests
-
-### Security (`src/security/`)
-- `auth.py` - Authentication handler for LangGraph deployment
 
 ### Testing (`tests/`)
 - `run_evaluate.py` - Main evaluation script configured to run on deep research bench
@@ -43,12 +44,13 @@ Contains two earlier research implementations:
 - `arxiv.md` - ArXiv research example
 - `pubmed.md` - PubMed research example
 - `inference-market.md` - Inference market analysis examples
+- `ras_example.md` - An example of using the `ras` module.
 
 ## Key Technologies
 - **LangGraph** - Workflow orchestration and graph execution
 - **LangChain** - LLM integration and tool calling
 - **Multiple LLM Providers** - OpenAI, Anthropic, Google, Groq, DeepSeek support
-- **Search APIs** - Tavily, OpenAI/Anthropic native search, DuckDuckGo, Exa
+- **Search APIs** - Tavily, OpenAI/Anthropic native search, DuckDuckGo, Exa, ras.arbitr.ru
 - **MCP Servers** - Model Context Protocol for extended capabilities
 
 ## Development Commands
