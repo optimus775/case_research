@@ -1,4 +1,4 @@
-# src/ras/downloader.py
+"""Utilities for downloading and parsing RAS PDF documents."""
 
 from __future__ import annotations
 import asyncio
@@ -150,9 +150,14 @@ class RasDownloader:
         logger = logging.getLogger(__name__)
         logger.debug("DIAG: Attempting Chrome PDF viewer download via Ctrl+S...")
         try:
-            await self.page.focus('body')
-            async with self.page.expect_download(timeout=15000) as download_info:
-                await self.page.keyboard.press('Control+s')
+            await self.page.wait_for_selector('embed[type="application/pdf"]', timeout=10000)
+            embed = self.page.locator('embed[type="application/pdf"]').first
+            try:
+                await embed.click()
+            except Exception:
+                await self.page.focus('body')
+            async with self.page.expect_download(timeout=20000) as download_info:
+                await self.page.keyboard.press('Control+S')
             download = await download_info.value
             await download.save_as(save_path)
             logger.debug("DIAG: Ctrl+S download succeeded: %s", save_path)
@@ -234,6 +239,25 @@ class RasDownloader:
                         getattr(frame, "url", "<main>"),
                         e,
                     )
+        # Fallback: create a temporary anchor with download attribute
+        try:
+            async with self.page.expect_download(timeout=10000) as download_info:
+                await self.page.evaluate(
+                    """() => {
+                        const a = document.createElement('a');
+                        a.href = window.location.href;
+                        a.download = '';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                    }"""
+                )
+            download = await download_info.value
+            await download.save_as(save_path)
+            logger.debug("DIAG: Anchor-based download succeeded: %s", save_path)
+            return True
+        except Exception as e:
+            logger.debug("DIAG: Anchor approach failed: %s", e)
         return False
 
     async def _fetch_with_httpx(self, url: str, referer: str, timeout_s: float) -> tuple[bytes, str]:
