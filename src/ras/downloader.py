@@ -1,4 +1,4 @@
-# src/ras/downloader.py
+"""Utilities for downloading and parsing RAS PDF documents."""
 
 from __future__ import annotations
 import asyncio
@@ -96,6 +96,15 @@ class RasDownloader:
         logger.debug("DIAG: Starting PDF download automation for URL: %s", url)
 
         await self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        # Ensure all network activity settles before proceeding; the PDF viewer
+        # often reloads the document multiple times which can break early
+        # download attempts.
+        try:
+            await self.page.wait_for_load_state("networkidle")
+        except Exception:
+            # ``networkidle`` may never trigger on some PDF viewer pages, so we
+            # fall back to a short sleep to avoid hanging the download process.
+            await asyncio.sleep(2)
         logger.debug("DIAG: Page navigation completed")
         await asyncio.sleep(2)
 
@@ -141,9 +150,14 @@ class RasDownloader:
         logger = logging.getLogger(__name__)
         logger.debug("DIAG: Attempting Chrome PDF viewer download via Ctrl+S...")
         try:
-            await self.page.focus('body')
-            async with self.page.expect_download(timeout=15000) as download_info:
-                await self.page.keyboard.press('Control+s')
+            await self.page.wait_for_selector('embed[type="application/pdf"]', timeout=10000)
+            embed = self.page.locator('embed[type="application/pdf"]').first
+            try:
+                await embed.click()
+            except Exception:
+                await self.page.focus('body')
+            async with self.page.expect_download(timeout=20000) as download_info:
+                await self.page.keyboard.press('Control+S')
             download = await download_info.value
             await download.save_as(save_path)
             logger.debug("DIAG: Ctrl+S download succeeded: %s", save_path)
@@ -173,24 +187,77 @@ class RasDownloader:
         """Simulates clicking a download button."""
         logger = logging.getLogger(__name__)
         logger.debug("DIAG: Attempting simulated manual download...")
+
+        # Try the Chrome PDF viewer's toolbar first (shadow DOM)
+        try:
+            async with self.page.expect_download(timeout=10000) as download_info:
+                await self.page.evaluate(
+                    """() => {
+                        const toolbar = document.querySelector('viewer-toolbar');
+                        const shadow = toolbar && toolbar.shadowRoot;
+                        const btn = shadow && shadow.querySelector('#download');
+                        if (btn) btn.click();
+                    }"""
+                )
+            download = await download_info.value
+            await download.save_as(save_path)
+            logger.debug("DIAG: Shadow-root download succeeded: %s", save_path)
+            return True
+        except Exception as e:
+            logger.debug("DIAG: Shadow-root approach failed: %s", e)
+
         selectors = [
             'cr-icon-button[iron-icon="cr:file-download"]',
             '[aria-label*="Download"]',
             '[title*="Download"]',
+            '[aria-label*="Скачать"]',
+            '[title*="Скачать"]',
+            '#download',
         ]
-        for selector in selectors:
-            try:
-                element = self.page.locator(selector).first
-                if await element.is_visible(timeout=1000):
-                    logger.debug("DIAG: Found download element with selector: %s", selector)
-                    async with self.page.expect_download(timeout=10000) as download_info:
-                        await element.click()
-                    download = await download_info.value
-                    await download.save_as(save_path)
-                    logger.debug("DIAG: Manual simulation succeeded: %s", save_path)
-                    return True
-            except Exception as e:
-                logger.debug("DIAG: Selector %s failed: %s", selector, e)
+
+        frames = [self.page, *self.page.frames]
+        for frame in frames:
+            for selector in selectors:
+                try:
+                    element = frame.locator(selector).first
+                    if await element.is_visible(timeout=3000):
+                        logger.debug(
+                            "DIAG: Found download element with selector: %s in frame: %s",
+                            selector,
+                            getattr(frame, "url", "<main>")
+                        )
+                        async with self.page.expect_download(timeout=10000) as download_info:
+                            await element.click()
+                        download = await download_info.value
+                        await download.save_as(save_path)
+                        logger.debug("DIAG: Manual simulation succeeded: %s", save_path)
+                        return True
+                except Exception as e:
+                    logger.debug(
+                        "DIAG: Selector %s in frame %s failed: %s",
+                        selector,
+                        getattr(frame, "url", "<main>"),
+                        e,
+                    )
+        # Fallback: create a temporary anchor with download attribute
+        try:
+            async with self.page.expect_download(timeout=10000) as download_info:
+                await self.page.evaluate(
+                    """() => {
+                        const a = document.createElement('a');
+                        a.href = window.location.href;
+                        a.download = '';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                    }"""
+                )
+            download = await download_info.value
+            await download.save_as(save_path)
+            logger.debug("DIAG: Anchor-based download succeeded: %s", save_path)
+            return True
+        except Exception as e:
+            logger.debug("DIAG: Anchor approach failed: %s", e)
         return False
 
     async def _fetch_with_httpx(self, url: str, referer: str, timeout_s: float) -> tuple[bytes, str]:
