@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import time
 from io import BytesIO
 from typing import Optional
 import re
@@ -41,6 +42,34 @@ class RasDownloader:
             h["Referer"] = referer
         return h
 
+    def _is_html_viewer(self, content: bytes) -> bool:
+        """Check if content is an HTML viewer page pretending to be a PDF"""
+        return (b"<html" in content[:500].lower() or
+                b"<!doctype" in content[:500].lower() or
+                b"<embed" in content or
+                b"<iframe" in content)
+
+    def _extract_embedded_url(self, content: bytes) -> Optional[str]:
+        """Extract embedded PDF URL from viewer HTML"""
+        # Look for various patterns of embedded PDFs
+        patterns = [
+            rb'embed\s+src="([^"]+)"',
+            rb'iframe\s+src="([^"]+)"',
+            rb'window\.location\.href\s*=\s*["\']([^"\']+\.pdf)',
+            rb'document\.location\.replace\s*\(\s*["\']([^"\']+\.pdf)',
+            rb'<a\s+href="([^"]+\.pdf)"[^>]*>'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, content)
+            if match:
+                url = match.group(1).decode()
+                # Handle base64 encoded PDFs
+                if url.startswith("data:application/pdf;base64,"):
+                    return None
+                return url
+        return None
+
     @async_retryable(max_attempts=3)
     async def fetch_pdf(self, url: str, referer: Optional[str] = None, timeout_s: float = 60.0) -> tuple[bytes, str]:
         logger = logging.getLogger(__name__)
@@ -52,21 +81,68 @@ class RasDownloader:
         u = (url or "").lower()
         if not (u.endswith(".pdf") or "/document/pdf/" in u or "/kad/pdfdocument/" in u):
             raise Exception(f"Non-PDF URL rejected by strict policy: {url}")
-        # Первая попытка: Playwright request API из того же контекста (без открытия HtmlDocument)
+        
+        # Use Playwright's download API when page is available
         if self.page is not None:
             try:
-                resp = await self.page.request.get(url, headers=self._headers(referer))
-                ct = (resp.headers.get("content-type", "") or "").lower()
-                content = await resp.body()
-                if ("application/pdf" in ct) or content.startswith(b"%PDF"):
-                    logger.debug("Fetched PDF via Playwright request: %d bytes", len(content))
-                    return content, url
-                else:
-                    logger.debug("Playwright request returned non-PDF (ct=%s); falling back to httpx", ct)
+                # Ensure downloads directory exists
+                downloads_dir = Path(self.save_dir)
+                downloads_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Generate unique filename
+                file_name = f"document_{int(time.time())}.pdf"
+                save_path = downloads_dir / file_name
+                
+                # Navigate to URL with timeout
+                await self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                
+                # Check if we're on a viewer page
+                is_viewer = await self.page.evaluate("""() => {
+                    return document.querySelector('embed[type="application/pdf"]') !== null ||
+                        document.querySelector('iframe[src*=".pdf"]') !== null;
+                }""")
+                
+                # Wait for download to start
+                async with self.page.expect_download(timeout=30000) as download_info:
+                    if is_viewer:
+                        # For viewer pages, trigger download via context menu
+                        await self.page.evaluate("""() => {
+                            const embed = document.querySelector('embed[type="application/pdf"]');
+                            if (embed) {
+                                const rect = embed.getBoundingClientRect();
+                                const event = new MouseEvent('contextmenu', {
+                                    bubbles: true,
+                                    clientX: rect.left + rect.width/2,
+                                    clientY: rect.top + rect.height/2
+                                });
+                                embed.dispatchEvent(event);
+                            }
+                        }""")
+                        # Wait for context menu to appear
+                        await self.page.wait_for_selector('text="Save as"', timeout=5000)
+                        await self.page.click('text="Save as"')
+                    else:
+                        # For direct PDFs, trigger via first button or link
+                        download_btn = await self.page.query_selector('a[href*=".pdf"], button')
+                        if download_btn:
+                            await download_btn.click()
+                
+                download = await download_info.value
+                
+                # Save file
+                await download.save_as(save_path)
+                logger.debug("Saved PDF via Playwright download: %s", save_path)
+                
+                # Read saved file
+                with open(save_path, "rb") as f:
+                    content = f.read()
+                
+                return content, url
             except Exception as e:
-                logger.debug("Playwright request path failed: %s; falling back to httpx", e)
+                logger.error("Playwright download failed: %s", e)
+                # Fall back to HTTPX method
 
-        # Вторая попытка: httpx с CookieJar и повтором при ddos-guard
+        # Fallback to HTTPX method
         transport = httpx.AsyncHTTPTransport()
         # Prepare cookie jar and pre-seed cookies from Playwright context if provided
         cookies = httpx.Cookies()
@@ -91,19 +167,24 @@ class RasDownloader:
             # First request may hit ddos-guard gate; allow one extra pass if HTML
             headers = self._headers(referer)
             r = await client.get(url, headers=headers)
+            
             r.raise_for_status()
             ct = (r.headers.get("content-type", "") or "").lower()
-            if ("application/pdf" not in ct) and not r.content.startswith(b"%PDF"):
+            content = r.content
+            
+            if ("application/pdf" not in ct) and not content.startswith(b"%PDF"):
                 # If server is ddos-guard and returned small HTML, retry once to pass the gate
-                if ("ddos-guard" in (" ".join([k.decode().lower()+":"+v.decode().lower() for k,v in r.headers.raw])) or "text/html" in ct) and len(r.content) < 8192:
+                if ("ddos-guard" in (" ".join([k.decode().lower()+":"+v.decode().lower() for k,v in r.headers.raw])) or "text/html" in ct) and len(content) < 8192:
                     logger.debug("Non-PDF response (likely ddos-guard). Repeating request after cookies.")
                     r = await client.get(url, headers=headers)
                     r.raise_for_status()
                     ct = (r.headers.get("content-type", "") or "").lower()
-            if ("application/pdf" not in ct) and not r.content.startswith(b"%PDF"):
+                    content = r.content
+            if ("application/pdf" not in ct) and not content.startswith(b"%PDF"):
                 raise Exception(f"Unexpected content-type for PDF: {ct}")
-            logger.debug("Fetched PDF bytes: %d from %s", len(r.content), url)
-            return r.content, url
+            logger.debug("Fetched PDF bytes: %d from %s", len(content), url)
+            
+            return content, url
 
     async def extract_text(self, pdf_bytes: bytes) -> str:
         text = ""
