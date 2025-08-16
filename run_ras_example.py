@@ -5,10 +5,11 @@ import os
 import sys
 from pathlib import Path
 import httpx
-from src.ras import create_ras_graph, RasQuery
+from src.ras import create_ras_graph, RasQuery, RasDownloader
 from src.ras.scraper import RasScraper
 from src.ras.browser import RasBrowser
 from urllib.parse import urlparse, unquote
+from playwright.async_api import async_playwright
 
 async def main():
     # Режим 1: только собрать первые 10 прямых PDF-ссылок и выйти
@@ -85,7 +86,7 @@ async def main():
 
         doc_guid, filename = parse_pdf_url(pdf_url)
         # Больше НЕ используем HtmlDocument как referer — только корень
-        referer = "https://ras.arbitr.ru/"
+        referer = "https://ras.vectorp.ru/"
 
         out_dir = Path(os.getenv("RAS_SAVE_DIR") or "downloads/ras")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +104,7 @@ async def main():
             ctx, page, ua = await rb.new_context()
             # Инициализация cookie на домене
             try:
-                await page.goto("https://ras.arbitr.ru/", wait_until="domcontentloaded")
+                await page.goto("https://ras.vectorp.ru/", wait_until="domcontentloaded")
             except Exception:
                 pass
             # HtmlDocument НЕ открываем; при необходимости серверные куки проставятся от корня
@@ -187,6 +188,7 @@ async def main():
                         pass
                 
                 def _on_download(download):
+                    nonlocal saved
                     try:
                         url = download.url
                         suggested_filename = download.suggested_filename
@@ -301,8 +303,135 @@ async def main():
                 if keep_open and not saved:
                     print("[DEBUG] All programmatic attempts have failed. Keeping page open.")
                     await asyncio.sleep(keep_open_timeout)
+                # Попытка кликнуть по кнопке Chromium PDF Viewer "Download" в правом верхнем углу
+                if not saved:
+                    try:
+                        print("[DEBUG] Attempting toolbar click on Chromium PDF viewer 'Download' button...")
+                        size = page.viewport_size or {"width": 1400, "height": 900}
+                        w, h = int(size.get("width", 1400)), int(size.get("height", 900))
+                        # Разбудим тулбар движением мыши
+                        await page.mouse.move(w // 2, 10)
+                        await asyncio.sleep(0.5)
+                        # Несколько координат около правого верхнего угла для большей надёжности
+                        coords = [(w - 40, 50), (w - 80, 50), (w - 40, 30), (w - 80, 30), (w - 60, 40)]
+                        for (x, y) in coords:
+                            try:
+                                async with page.expect_download(timeout=6000) as di2:
+                                    await page.mouse.click(x, y, button='left')
+                                dl2 = await di2.value
+                                await dl2.save_as(out_path)
+                                if out_path.exists() and out_path.stat().st_size > 1000:
+                                    with open(out_path, 'rb') as f:
+                                        if f.read(4) == b'%PDF':
+                                            print(f"[DEBUG] SUCCESS! PDF downloaded via toolbar click to {out_path}")
+                                            saved = True
+                                            break
+                            except Exception as e:
+                                print(f"[DEBUG] Toolbar click attempt at ({x},{y}) failed: {e}")
+                            await asyncio.sleep(0.5)
+                    except Exception as e:
+                        print(f"[DEBUG] Toolbar click fallback failed: {e}")
+                # Если не сохранили через viewer/интерсепт — пробуем принудительный download через скрытую ссылку
+                if not saved:
+                    try:
+                        print("[DEBUG] Attempting forced download via hidden <a download>...")
+                        async with page.expect_download() as download_info2:
+                            await page.evaluate(
+                                "(url) => { const a = document.createElement('a'); a.href = url; a.download = 'document.pdf'; a.target = '_self'; a.style.display='none'; document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(), 1000); }",
+                                pdf_url,
+                            )
+                        download2 = await download_info2.value
+                        await download2.save_as(out_path)
+                        if out_path.exists() and out_path.stat().st_size > 1000:
+                            with open(out_path, 'rb') as f:
+                                if f.read(4) == b'%PDF':
+                                    print(f"[DEBUG] SUCCESS! PDF downloaded via hidden link to {out_path}")
+                                    saved = True
+                    except Exception as e:
+                        print(f"[DEBUG] Hidden link download failed: {e}")
+
+                # Если не сохранили через viewer/интерсепт/hidden link — пробуем вытащить PDF через in-page fetch из <embed>
+                if not saved:
+                    try:
+                        embed_src = await page.evaluate("() => { const e = document.querySelector('embed'); return e ? (e.getAttribute('src') || e.src) : null; }")
+                        if embed_src:
+                            print(f"[DEBUG] Trying in-page fetch from embed src: {embed_src}")
+                            # Fetch the PDF bytes within the page context to preserve all headers/cookies
+                            js = """
+                            async (url) => {
+                              const res = await fetch(url, { credentials: 'include' });
+                              const buf = await res.arrayBuffer();
+                              const bytes = new Uint8Array(buf);
+                              let bin = '';
+                              for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                              return btoa(bin);
+                            }
+                            """
+                            b64 = await page.evaluate(js, embed_src)
+                            if b64:
+                                import base64
+                                raw = base64.b64decode(b64)
+                                if raw and raw.startswith(b"%PDF"):
+                                    out_path.write_bytes(raw)
+                                    print(f"[DEBUG] SUCCESS: PDF saved via in-page fetch to {out_path}")
+                                    saved = True
+                                else:
+                                    print(f"[DEBUG] In-page fetch returned {len(raw) if raw else 0} bytes (not a PDF)")
+                    except Exception as e:
+                        print(f"[DEBUG] In-page fetch fallback failed: {e}")
+
+                # Если не сохранили через viewer/интерсепт/hidden link/in-page fetch — пробуем прямую загрузку через RasDownloader
+                if not saved:
+                    try:
+                        cookies_hdr = await rb.cookies_header(ctx, domain_filter="vectorp.ru")
+                        dl = RasDownloader(user_agent=ua, cookies_header=cookies_hdr, page=page)
+                        content, final_url = await dl.fetch_pdf(pdf_url, referer="https://ras.vectorp.ru/")
+                        if content and content.startswith(b"%PDF") and len(content) > 1000:
+                            out_path.write_bytes(content)
+                            print(f"[DEBUG] SUCCESS: PDF saved via RasDownloader to {out_path}")
+                            saved = True
+                    except Exception as e:
+                        print(f"[DEBUG] RasDownloader fallback failed: {e}")
                 await page.close()
                 await ctx.close()
+
+        # Доп. фоллбек: используем persistent context с включенной настройкой
+        # "Always open PDFs externally", чтобы браузер не открывал PDF во viewer, а сразу скачивал
+        if not saved:
+            try:
+                print("[DEBUG] Persistent context fallback: force external PDF download via browser prefs")
+                profile_dir = out_dir / "chrome_profile"
+                (profile_dir / "Default").mkdir(parents=True, exist_ok=True)
+                pref_path = profile_dir / "Default" / "Preferences"
+                if not pref_path.exists():
+                    import json as _json
+                    prefs = {
+                        "download": {"prompt_for_download": False, "default_directory": str(out_dir.resolve())},
+                        "plugins": {"always_open_pdf_externally": True},
+                    }
+                    pref_path.write_text(_json.dumps(prefs), encoding="utf-8")
+                async with async_playwright() as pw:
+                    ctx2 = await pw.chromium.launch_persistent_context(
+                        str(profile_dir),
+                        headless=False,
+                        accept_downloads=True,
+                        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                    )
+                    try:
+                        pg = ctx2.pages[0] if ctx2.pages else await ctx2.new_page()
+                        async with pg.expect_download(timeout=15000) as dlp:
+                            await pg.goto(pdf_url)
+                        d2 = await dlp.value
+                        await d2.save_as(out_path)
+                        if out_path.exists() and out_path.stat().st_size > 1000:
+                            with open(out_path, "rb") as f:
+                                if f.read(4) == b"%PDF":
+                                    print(f"[DEBUG] SUCCESS! Persistent context downloaded PDF to {out_path}")
+                                    saved = True
+                    finally:
+                        await ctx2.close()
+            except Exception as e:
+                print(f"[DEBUG] Persistent context fallback failed: {e}")
 
         if not saved:
             print({"error": "download_failed", "url": pdf_url, "referer": referer})

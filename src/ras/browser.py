@@ -18,7 +18,7 @@ USER_AGENTS = [
 
 
 class RasBrowser:
-    """Playwright browser manager with sane defaults and proxy support."""
+    """Playwright browser manager with sane defaults (proxy disabled by default)."""
 
     def __init__(self, headless: bool | None = None, proxy: str | None = None):
         self._pw = None
@@ -26,7 +26,8 @@ class RasBrowser:
         if headless is None:
             headless = os.getenv("RAS_HEADLESS", "true").lower() == "true"
         self.headless = headless
-        self.proxy = proxy or os.getenv("RAS_PROXY")
+        # Disable implicit proxy via env; only use explicit argument
+        self.proxy = proxy
 
     def _proxy_args(self) -> dict | None:
         if not self.proxy:

@@ -18,7 +18,8 @@ class RasDownloader:
     def __init__(self, user_agent: str | None = None, cookies_header: str | None = None, page=None):
         self.user_agent = user_agent
         self.cookies_header = cookies_header
-        self.http_proxy = os.getenv("RAS_HTTP_PROXY") or os.getenv("RAS_PROXY")
+        # Disable proxy usage; do not read env for http proxy
+        self.http_proxy = None
         self.page = page
         logging.getLogger(__name__).debug(
             "RasDownloader initialized (proxy=%s, ua=%s, has_cookies=%s)",
@@ -45,7 +46,7 @@ class RasDownloader:
         logger = logging.getLogger(__name__)
         # По умолчанию используем корневой реферер, без HtmlDocument
         if not referer:
-            referer = "https://ras.arbitr.ru/"
+            referer = "https://ras.vectorp.ru/"
         logger.debug("Fetching PDF (strict): %s (referer=%s)", url, referer)
         # Strict PDF-only policy: accept only direct PDF endpoints
         u = (url or "").lower()
@@ -66,7 +67,7 @@ class RasDownloader:
                 logger.debug("Playwright request path failed: %s; falling back to httpx", e)
 
         # Вторая попытка: httpx с CookieJar и повтором при ddos-guard
-        transport = httpx.AsyncHTTPTransport(proxy=self.http_proxy) if self.http_proxy else httpx.AsyncHTTPTransport()
+        transport = httpx.AsyncHTTPTransport()
         # Prepare cookie jar and pre-seed cookies from Playwright context if provided
         cookies = httpx.Cookies()
         if self.cookies_header:
@@ -76,8 +77,8 @@ class RasDownloader:
                     if not part or "=" not in part:
                         continue
                     name, value = part.split("=", 1)
-                    # Scope cookies to arbitr.ru
-                    cookies.set(name.strip(), value.strip(), domain=".arbitr.ru", path="/")
+                    # Scope cookies to vectorp.ru
+                    cookies.set(name.strip(), value.strip(), domain=".vectorp.ru", path="/")
             except Exception:
                 pass
         async with httpx.AsyncClient(
@@ -127,7 +128,7 @@ class RasDownloader:
         if not url:
             logger.debug("Skipping item without direct PDF URL (case=%s)", item.case_number)
             return None
-        pdf_bytes, final_url = await self.fetch_pdf(url, referer="https://ras.arbitr.ru/")
+        pdf_bytes, final_url = await self.fetch_pdf(url, referer="https://ras.vectorp.ru/")
         text = await self.extract_text(pdf_bytes)
         saved_path = None
         if self.save_pdfs:

@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any
 
 
 class RasQuery(BaseModel):
-    """Query filters for ras.arbitr.ru search.
+    """Query filters for ras.vectorp.ru search.
     NOTE: adapt field mapping to site filter controls/XHR payload.
     """
     text: Optional[str] = Field(default=None, description="Keywords/factual narrative")

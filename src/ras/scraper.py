@@ -17,7 +17,7 @@ from .net import async_retryable
 
 
 class RasScraper:
-    BASE = "https://ras.arbitr.ru"
+    BASE = "https://ras.vectorp.ru"
 
     # Update these patterns after Network inspection in DevTools → XHR.
     XHR_LIST_PATTERNS = [
@@ -172,7 +172,7 @@ class RasScraper:
             seq = None
             if isinstance(data, dict):
                 # plausible keys: Result.Items, results, documents, items
-                # First try nested Result.Items as seen on ras.arbitr.ru
+                # First try nested Result.Items as seen on ras.vectorp.ru
                 if "Result" in data and isinstance(data["Result"], dict):
                     for k in ("Items", "items", "Rows", "rows"):
                         if k in data["Result"] and isinstance(data["Result"][k], list):
@@ -270,8 +270,8 @@ class RasScraper:
         # Optional deep network debug
         if os.getenv("RAS_DEBUG_NET", "").lower() in ("1", "true", "yes"):
             try:
-                page.on("request", lambda req: logger.debug("REQ %s %s", req.method, req.url) if "arbitr.ru" in req.url else None)
-                page.on("requestfailed", lambda req: logger.warning("REQ_FAILED %s %s: %s", req.method, req.url, req.failure) if "arbitr.ru" in req.url else None)
+                page.on("request", lambda req: logger.debug("REQ %s %s", req.method, req.url) if "vectorp.ru" in req.url else None)
+                page.on("requestfailed", lambda req: logger.warning("REQ_FAILED %s %s: %s", req.method, req.url, req.failure) if "vectorp.ru" in req.url else None)
             except Exception:
                 pass
         bucket = await self._intercept_json(page, self._predicate)
@@ -536,7 +536,7 @@ class RasScraper:
         logger = logging.getLogger(__name__)
         logger.debug("API fallback: starting")
         ua = await page.evaluate("() => navigator.userAgent")
-        cookies_hdr = await self._cookies_header_from_page(page, domain_filter="arbitr.ru")
+        cookies_hdr = await self._cookies_header_from_page(page, domain_filter="vectorp.ru")
         token: Optional[str] = None
         # Try to obtain Recaptcha token via site’s API
         try:
@@ -566,8 +566,8 @@ class RasScraper:
         if token:
             headers["RecaptchaToken"] = token
 
-        proxy = os.getenv("RAS_HTTP_PROXY") or os.getenv("RAS_PROXY")
-        transport = httpx.AsyncHTTPTransport(proxy=proxy) if proxy else httpx.AsyncHTTPTransport()
+        # Disable proxy usage when calling API fallback
+        transport = httpx.AsyncHTTPTransport()
         url = f"{self.BASE}/Ras/Search"
         try:
             async with httpx.AsyncClient(timeout=60, transport=transport, follow_redirects=True) as client:

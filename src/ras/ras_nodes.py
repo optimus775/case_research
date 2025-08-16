@@ -99,7 +99,7 @@ async def ras_fetch_docs_node(state):
         before = len(listings)
         listings = [it for it in listings if it.download_url]
         logger.debug("ras_fetch_docs_node: items with direct PDF URL=%d (from %d)", len(listings), before)
-        cookies_hdr = await rb.cookies_header(ctx, domain_filter="arbitr.ru")
+        cookies_hdr = await rb.cookies_header(ctx, domain_filter="vectorp.ru")
         dl = RasDownloader(user_agent=ua, cookies_header=cookies_hdr, page=page)
 
         limiter = RateLimiter(max_conc)
