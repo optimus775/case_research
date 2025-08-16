@@ -182,6 +182,25 @@ class RasDownloader:
         """Simulates clicking a download button."""
         logger = logging.getLogger(__name__)
         logger.debug("DIAG: Attempting simulated manual download...")
+
+        # Try the Chrome PDF viewer's toolbar first (shadow DOM)
+        try:
+            async with self.page.expect_download(timeout=10000) as download_info:
+                await self.page.evaluate(
+                    """() => {
+                        const toolbar = document.querySelector('viewer-toolbar');
+                        const shadow = toolbar && toolbar.shadowRoot;
+                        const btn = shadow && shadow.querySelector('#download');
+                        if (btn) btn.click();
+                    }"""
+                )
+            download = await download_info.value
+            await download.save_as(save_path)
+            logger.debug("DIAG: Shadow-root download succeeded: %s", save_path)
+            return True
+        except Exception as e:
+            logger.debug("DIAG: Shadow-root approach failed: %s", e)
+
         selectors = [
             'cr-icon-button[iron-icon="cr:file-download"]',
             '[aria-label*="Download"]',
@@ -191,13 +210,12 @@ class RasDownloader:
             '#download',
         ]
 
-        # Search for the download button in the main page and any attached frames
         frames = [self.page, *self.page.frames]
         for frame in frames:
             for selector in selectors:
                 try:
                     element = frame.locator(selector).first
-                    if await element.is_visible(timeout=1000):
+                    if await element.is_visible(timeout=3000):
                         logger.debug(
                             "DIAG: Found download element with selector: %s in frame: %s",
                             selector,
