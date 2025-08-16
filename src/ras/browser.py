@@ -46,8 +46,11 @@ class RasBrowser:
     async def __aenter__(self) -> "RasBrowser":
         logging.getLogger(__name__).debug("Starting Playwright (headless=%s, proxy=%s)", self.headless, bool(self.proxy))
         self._pw = await async_playwright().start()
+        downloads_dir = os.path.join(os.getcwd(), 'downloads', 'ras')
+        os.makedirs(downloads_dir, exist_ok=True)
         launch_args = dict(
             headless=self.headless,
+            downloads_path=downloads_dir,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",

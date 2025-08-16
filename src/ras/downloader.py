@@ -35,7 +35,7 @@ class RasDownloader:
         }
         if self.user_agent:
             h["User-Agent"] = self.user_agent
-        # Do not set raw Cookie header here; let httpx CookieJar manage cookies
+        # Не прокидываем сырые куки заголовком — используем CookieJar
         if referer:
             h["Referer"] = referer
         return h
@@ -43,12 +43,15 @@ class RasDownloader:
     @async_retryable(max_attempts=3)
     async def fetch_pdf(self, url: str, referer: Optional[str] = None, timeout_s: float = 60.0) -> tuple[bytes, str]:
         logger = logging.getLogger(__name__)
+        # По умолчанию используем корневой реферер, без HtmlDocument
+        if not referer:
+            referer = "https://ras.arbitr.ru/"
         logger.debug("Fetching PDF (strict): %s (referer=%s)", url, referer)
         # Strict PDF-only policy: accept only direct PDF endpoints
         u = (url or "").lower()
         if not (u.endswith(".pdf") or "/document/pdf/" in u or "/kad/pdfdocument/" in u):
             raise Exception(f"Non-PDF URL rejected by strict policy: {url}")
-        # First try via Playwright's request API (shares browser cookies/session)
+        # Первая попытка: Playwright request API из того же контекста (без открытия HtmlDocument)
         if self.page is not None:
             try:
                 resp = await self.page.request.get(url, headers=self._headers(referer))
@@ -62,7 +65,7 @@ class RasDownloader:
             except Exception as e:
                 logger.debug("Playwright request path failed: %s; falling back to httpx", e)
 
-        # Fetch via httpx with cookie jar and ddos-guard handling
+        # Вторая попытка: httpx с CookieJar и повтором при ddos-guard
         transport = httpx.AsyncHTTPTransport(proxy=self.http_proxy) if self.http_proxy else httpx.AsyncHTTPTransport()
         # Prepare cookie jar and pre-seed cookies from Playwright context if provided
         cookies = httpx.Cookies()
@@ -122,9 +125,9 @@ class RasDownloader:
         # Strict: only use direct PDF links discovered earlier
         url = item.download_url
         if not url:
-            logger.debug("Skipping item without direct PDF URL (detail=%s, case=%s)", item.detail_url, item.case_number)
+            logger.debug("Skipping item without direct PDF URL (case=%s)", item.case_number)
             return None
-        pdf_bytes, final_url = await self.fetch_pdf(url, referer=item.detail_url)
+        pdf_bytes, final_url = await self.fetch_pdf(url, referer="https://ras.arbitr.ru/")
         text = await self.extract_text(pdf_bytes)
         saved_path = None
         if self.save_pdfs:

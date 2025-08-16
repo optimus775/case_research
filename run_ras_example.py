@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 import sys
 from pathlib import Path
+import httpx
 from src.ras import create_ras_graph, RasQuery
 from src.ras.scraper import RasScraper
 from src.ras.browser import RasBrowser
@@ -83,12 +84,21 @@ async def main():
             return doc_guid, filename
 
         doc_guid, filename = parse_pdf_url(pdf_url)
-        referer = f"https://ras.arbitr.ru/Ras/HtmlDocument/{doc_guid}" if doc_guid else "https://ras.arbitr.ru/"
+        # Больше НЕ используем HtmlDocument как referer — только корень
+        referer = "https://ras.arbitr.ru/"
 
         out_dir = Path(os.getenv("RAS_SAVE_DIR") or "downloads/ras")
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / ("stage2_" + filename)
 
+        # Опции удержания окна открытым для ручной проверки
+        keep_open = (os.getenv("RAS_KEEP_OPEN", "").lower() in ("1", "true", "yes")) or ("--keep-open" in sys.argv)
+        try:
+            keep_open_timeout = int(os.getenv("RAS_KEEP_OPEN_TIMEOUT", "300"))
+        except Exception:
+            keep_open_timeout = 300
+
+        saved = False
         async with RasBrowser() as rb:
             ctx, page, ua = await rb.new_context()
             # Инициализация cookie на домене
@@ -96,132 +106,206 @@ async def main():
                 await page.goto("https://ras.arbitr.ru/", wait_until="domcontentloaded")
             except Exception:
                 pass
-            # Переходим на HtmlDocument (реферер), чтобы у сервера были все контекстные куки
-            try:
-                await page.goto(referer, wait_until="domcontentloaded")
-            except Exception:
-                pass
+            # HtmlDocument НЕ открываем; при необходимости серверные куки проставятся от корня
 
             # Отладка: запишем, какой URL берём из файла и какие URL реально уходит в Chromium
             debug_file = out_dir / "stage2_debug_links.txt"
             requests_seen: list[str] = []
             responses_seen: list[str] = []
+            downloads_intercepted: list[str] = []
             try:
                 def _on_request(req):
                     u = req.url
                     if ("/Document/Pdf/" in u) or ("/Kad/PdfDocument/" in u) or u.lower().endswith(".pdf"):
                         requests_seen.append(u)
+                        print(f"[DEBUG] PDF request intercepted: {u}")
+                
                 def _on_response(resp):
+                    nonlocal saved
                     try:
                         u = resp.url
                         ct = (resp.headers.get("content-type") or "").lower()
                         if ("/Document/Pdf/" in u) or (u.lower().endswith(".pdf")) or ("application/pdf" in ct):
-                            responses_seen.append(f"{u} ct={ct}")
+                            responses_seen.append(f"{u} ct={ct} status={resp.status}")
+                            print(f"[DEBUG] PDF response intercepted: {u} ct={ct} status={resp.status}")
+                            
+                            # If this is a successful PDF response, save it immediately
+                            if resp.status == 200 and "application/pdf" in ct and not saved:
+                                print(f"[DEBUG] SUCCESS: Capturing PDF response body immediately...")
+                                try:
+                                    # Use create_task to run the async response.body() in the current event loop
+                                    import asyncio
+                                    
+                                    async def save_pdf_from_response():
+                                        nonlocal saved
+                                        try:
+                                            body = await resp.body()
+                                            
+                                            # Enhanced diagnostic logging
+                                            print(f"[DEBUG] Response body length: {len(body) if body else 0}")
+                                            
+                                            if body and len(body) > 0:
+                                                # Show first 200 bytes as text (for error messages)
+                                                try:
+                                                    preview_text = body[:200].decode('utf-8', errors='ignore')
+                                                    print(f"[DEBUG] Response body preview (text): {repr(preview_text)}")
+                                                except Exception:
+                                                    pass
+                                                    
+                                                # Show first 20 bytes as hex (for binary content)
+                                                preview_hex = body[:20].hex() if len(body) >= 20 else body.hex()
+                                                print(f"[DEBUG] Response body preview (hex): {preview_hex}")
+                                                
+                                                # Check if it looks like HTML error page
+                                                if body.startswith(b'<!DOCTYPE') or body.startswith(b'<html'):
+                                                    print(f"[DEBUG] Response appears to be HTML error page, not PDF")
+                                                    return False
+                                                
+                                                # Check for redirect or error messages
+                                                if b'redirect' in body.lower() or b'error' in body.lower():
+                                                    print(f"[DEBUG] Response contains redirect/error indicators")
+                                                    
+                                            if body and len(body) > 1000 and body.startswith(b"%PDF"):
+                                                out_path.write_bytes(body)
+                                                print(f"[DEBUG] SUCCESS: PDF automatically saved from intercepted response to {out_path}")
+                                                print(f"[DEBUG] Saved {len(body)} bytes")
+                                                saved = True
+                                                return True
+                                            else:
+                                                print(f"[DEBUG] Response body not valid PDF: len={len(body) if body else 0}")
+                                        except Exception as e:
+                                            print(f"[DEBUG] Failed to save PDF from response: {e}")
+                                        return False
+                                    
+                                    # Schedule the task to run in the current event loop
+                                    task = asyncio.create_task(save_pdf_from_response())
+                                    print(f"[DEBUG] Scheduled PDF save task")
+                                    
+                                except Exception as e:
+                                    print(f"[DEBUG] Error creating PDF save task: {e}")
                     except Exception:
                         pass
+                
+                def _on_download(download):
+                    try:
+                        url = download.url
+                        suggested_filename = download.suggested_filename
+                        downloads_intercepted.append(f"url={url} filename={suggested_filename}")
+                        print(f"[DEBUG] Browser download intercepted: {url} -> {suggested_filename}")
+                        # Save the download to our expected location
+                        try:
+                            download_path = out_dir / ("manual_" + suggested_filename)
+                            download.save_as(download_path)
+                            print(f"[DEBUG] Manual download saved to: {download_path}")
+                            # Also save to the main expected path
+                            main_path = out_path
+                            download.save_as(main_path)
+                            print(f"[DEBUG] Manual download also saved to: {main_path}")
+                            saved = True  # Mark as successfully saved
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to save download: {e}")
+                            # Try alternative approach - wait and copy from default location
+                            try:
+                                import time
+                                time.sleep(2)  # Wait for download to complete
+                                # Try to find the file in the default downloads directory
+                                default_path = download.path()
+                                if default_path and Path(default_path).exists():
+                                    import shutil
+                                    shutil.copy2(default_path, out_path)
+                                    print(f"[DEBUG] Copied from {default_path} to {out_path}")
+                                    saved = True
+                            except Exception as e2:
+                                print(f"[DEBUG] Alternative download save failed: {e2}")
+                    except Exception as e:
+                        print(f"[DEBUG] Download handler error: {e}")
+                
+                # Setup Chromium CDP listener to capture binary PDF responses (if available)
+                try:
+                    cdp = await ctx.new_cdp_session(page)
+                    await cdp.send("Network.enable")
+                    def _cdp_response(params):
+                        try:
+                            request_id = params.get("requestId")
+                            response = params.get("response", {}) or {}
+                            mime = (response.get("mimeType") or "").lower()
+                            url = response.get("url", "")
+                            status = response.get("status")
+                            if (("application/pdf" in mime) or (url.lower().endswith(".pdf"))) and status == 200:
+                                print(f"[DEBUG-CDP] PDF response detected via CDP: {url} mime={mime} status={status}")
+                                async def _fetch_response():
+                                    nonlocal saved
+                                    try:
+                                        body_res = await cdp.send("Network.getResponseBody", {"requestId": request_id})
+                                        body = body_res.get("body")
+                                        if body_res.get("base64Encoded"):
+                                            import base64
+                                            raw = base64.b64decode(body)
+                                        else:
+                                            raw = body.encode("utf-8")
+                                        print(f"[DEBUG-CDP] Got body len={len(raw)}")
+                                        if raw and raw.startswith(b"%PDF"):
+                                            out_path.write_bytes(raw)
+                                            print(f"[DEBUG-CDP] Saved PDF from CDP to {out_path} ({len(raw)} bytes)")
+                                            saved = True
+                                    except Exception as e:
+                                        print(f"[DEBUG-CDP] Failed to get response body via CDP: {e}")
+                                asyncio.create_task(_fetch_response())
+                        except Exception as e:
+                            print(f"[DEBUG-CDP] CDP response handler error: {e}")
+                    cdp.on("Network.responseReceived", _cdp_response)
+                except Exception as e:
+                    print(f"[DEBUG-CDP] CDP setup failed: {e}")
+                
                 page.on("request", _on_request)
                 page.on("response", _on_response)
-            except Exception:
-                pass
-            # Сразу пишем входной URL в файл
+                page.on("download", _on_download)
+            except Exception as e:
+                print(f"[DEBUG] Failed to setup event handlers: {e}")
+            # Финальная гибридная стратегия с последней отчаянной попыткой через JS
             try:
-                with open(debug_file, "a", encoding="utf-8") as f:
-                    f.write(f"input={pdf_url}\nreferer={referer}\n")
-            except Exception:
-                pass
+                print(f"[DEBUG] Last Ditch Effort: Hybrid approach with advanced JS injection.")
+                
+                await page.goto(pdf_url, wait_until="networkidle")
 
-            # Попытка 1: Нажать "Скачать" и перехватить download (надежнее всего для одного файла)
-            try:
-                # Подождём немного, чтобы кнопка/ссылка скачивания появилась
+                # 1. Ждем, пока viewer будет готов, проверяя наличие внутреннего API
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=8000)
+                    await page.wait_for_function("window.PDFViewerApplication && window.PDFViewerApplication.download", timeout=15000)
+                    print("[DEBUG] PDF Viewer Application API is available.")
                 except Exception:
-                    pass
-                sels = [
-                    "a:has-text('Скачать')",
-                    "button:has-text('Скачать')",
-                    "a[href*='/Document/Pdf/']",
-                    "a[href*='/Kad/PdfDocument/']",
-                    "a[href$='.pdf']",
-                ]
-                dl_link = None
-                for sel in sels:
-                    try:
-                        loc = page.locator(sel)
-                        if await loc.count() > 0:
-                            dl_link = loc.first
-                            break
-                    except Exception:
-                        continue
-                if dl_link is not None:
-                    try:
-                        async with page.expect_download(timeout=30000) as dl_info:
-                            await dl_link.click()
-                        d = await dl_info.value
-                        suggested = d.suggested_filename or filename
-                        save_path = out_dir / ("stage2_" + suggested)
-                        await d.save_as(str(save_path))
-                        print({"stage": "click_download", "saved": str(save_path), "suggested": suggested})
-                        # Финальная запись в отладочный файл: какие URL реально ушли
-                        try:
-                            with open(debug_file, "a", encoding="utf-8") as f:
-                                if requests_seen:
-                                    f.write("requests:\n" + "\n".join(requests_seen) + "\n")
-                                if responses_seen:
-                                    f.write("responses:\n" + "\n".join(responses_seen) + "\n")
-                                f.write("----\n")
-                        except Exception:
-                            pass
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                        await ctx.close()
-                        return
-                    except Exception as e:
-                        print({"stage": "click_download_error", "error": str(e)})
+                    raise Exception("PDF Viewer API (PDFViewerApplication.download) never became available.")
 
-                # Попытка 2: Навигация напрямую на PDF и чтение ответа
-                try:
-                    def _pred(resp):
-                        u = resp.url
-                        return ("/Document/Pdf/" in u) or u.lower().endswith(".pdf")
-                    fut = page.wait_for_event("response", timeout=20000, predicate=_pred)
-                    await page.goto(pdf_url, wait_until="domcontentloaded")
-                    resp = await fut
-                    ct = (resp.headers.get("content-type") or "").lower()
-                    body = await resp.body()
-                    print({"stage": "page_goto_pdf", "status": resp.status, "ct": ct, "len": len(body)})
-                    # Запишем, что реально запросили
-                    try:
-                        with open(debug_file, "a", encoding="utf-8") as f:
-                            if requests_seen:
-                                f.write("requests:\n" + "\n".join(requests_seen) + "\n")
-                            f.write(f"response_url={resp.url} ct={ct}\n")
-                            if responses_seen:
-                                f.write("responses:\n" + "\n".join(responses_seen) + "\n")
-                            f.write("----\n")
-                    except Exception:
-                        pass
-                    if ("application/pdf" in ct) or body.startswith(b"%PDF"):
-                        out_path.write_bytes(body)
-                        print({"saved": str(out_path), "bytes": len(body)})
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                        await ctx.close()
-                        return
-                except Exception as e:
-                    print({"stage": "page_goto_pdf_error", "error": str(e)})
+                # 2. Вызываем внутренний метод `download` самого viewer'а
+                print("[DEBUG] Triggering viewer's internal download method.")
+                # Ожидаем событие скачивания, которое должно быть инициировано кликом
+                async with page.expect_download() as download_info:
+                    await page.evaluate("window.PDFViewerApplication.download()")
+                
+                download = await download_info.value
+                await download.save_as(out_path)
 
+                # 3. Проверка
+                if out_path.exists() and out_path.stat().st_size > 1000:
+                    with open(out_path, "rb") as f:
+                        if f.read(4) == b'%PDF':
+                            print(f"[DEBUG] SUCCESS! PDF downloaded via internal API to {out_path}")
+                            saved = True
+                
+                if not saved:
+                    raise Exception("Internal API call did not result in a valid PDF download.")
+
+            except Exception as e:
+                print(f"[DEBUG] Last ditch effort failed: {e}")
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                print(f"[DEBUG] Final status: saved={saved}")
+                if keep_open and not saved:
+                    print("[DEBUG] All programmatic attempts have failed. Keeping page open.")
+                    await asyncio.sleep(keep_open_timeout)
+                await page.close()
                 await ctx.close()
-        print({"error": "download_failed", "url": pdf_url, "referer": referer})
+
+        if not saved:
+            print({"error": "download_failed", "url": pdf_url, "referer": referer})
         return
 
     # Режим 2: полный граф с загрузкой документов
