@@ -95,6 +95,10 @@ async def ras_fetch_docs_node(state):
         # First, try to enrich with direct download links (for top N)
         scraper = RasScraper()
         listings = await scraper.enrich_with_downloads(page, listings, max_items=50)
+        # Keep only items with a direct PDF URL (strict policy)
+        before = len(listings)
+        listings = [it for it in listings if it.download_url]
+        logger.debug("ras_fetch_docs_node: items with direct PDF URL=%d (from %d)", len(listings), before)
         cookies_hdr = await rb.cookies_header(ctx, domain_filter="arbitr.ru")
         dl = RasDownloader(user_agent=ua, cookies_header=cookies_hdr, page=page)
 
@@ -104,6 +108,7 @@ async def ras_fetch_docs_node(state):
         async def task(it: RasListingItem):
             async with limiter:
                 try:
+                    logger.debug("Downloading PDF for case=%s url=%s", it.case_number or it.act_id, it.download_url)
                     doc = await dl.fetch_and_parse(it)
                     if doc:
                         if not doc.text:

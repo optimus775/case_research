@@ -204,16 +204,46 @@ class RasScraper:
                 if not detail and act_id:
                     # Fallback to known HtmlDocument route
                     detail = f"{self.BASE}/Ras/HtmlDocument/{act_id}"
-                # Derive direct PDF link when possible: /Kad/PdfDocument/{CaseId}/{Id}/{FileName}
-                derived_pdf = None
+                # Derive direct PDF links when possible:
+                # 1) /Document/Pdf/{CaseId}/{Id}/{FileName}?isAddStamp=True (preferred)
+                # 2) /Kad/PdfDocument/{CaseId}/{Id}/{FileName}
+                derived_pdf_doc = None
+                derived_pdf_kad = None
                 try:
                     case_guid = row.get("CaseId") or row.get("CaseID")
                     doc_guid = row.get("Id") or row.get("DocumentId") or row.get("ActId")
                     file_name = row.get("FileName") or row.get("Title")
                     if case_guid and doc_guid and file_name:
-                        derived_pdf = f"{self.BASE}/Kad/PdfDocument/{case_guid}/{doc_guid}/{quote(file_name)}"
+                        base_name = quote(file_name)
+                        derived_pdf_doc = f"{self.BASE}/Document/Pdf/{case_guid}/{doc_guid}/{base_name}?isAddStamp=True"
+                        derived_pdf_kad = f"{self.BASE}/Kad/PdfDocument/{case_guid}/{doc_guid}/{base_name}"
                 except Exception:
-                    derived_pdf = None
+                    derived_pdf_doc = None
+                    derived_pdf_kad = None
+                # Choose the best download URL:
+                # - Prefer direct PDF links we derive (Document/Pdf or Kad/PdfDocument)
+                # - Only trust row[DownloadUrl] if it clearly points to a PDF
+                raw_dl = (row.get("DownloadUrl") or "") if isinstance(row.get("DownloadUrl"), str) else ""
+                raw_dl_abs = None
+                try:
+                    if raw_dl and not raw_dl.startswith("http"):
+                        raw_dl_abs = f"{self.BASE}{raw_dl}"
+                    else:
+                        raw_dl_abs = raw_dl or None
+                except Exception:
+                    raw_dl_abs = raw_dl or None
+                looks_like_pdf = False
+                if raw_dl_abs:
+                    s = raw_dl_abs.lower()
+                    looks_like_pdf = s.endswith(".pdf") or "/document/pdf/" in s or "/kad/pdfdocument/" in s
+                chosen_download = None
+                if derived_pdf_doc:
+                    chosen_download = derived_pdf_doc
+                elif derived_pdf_kad:
+                    chosen_download = derived_pdf_kad
+                elif looks_like_pdf:
+                    chosen_download = raw_dl_abs
+
                 items.append(RasListingItem(
                     act_id=act_id,
                     case_id=row.get("CaseId") or row.get("CaseID"),
@@ -227,7 +257,7 @@ class RasScraper:
                     title=row.get("Title") or row.get("Заголовок") or row.get("FileName"),
                     parties=row.get("Parties") or row.get("Стороны"),
                     detail_url=detail,
-                    download_url=row.get("DownloadUrl") or derived_pdf,
+                    download_url=chosen_download,
                     extra=row,
                 ))
         return items
@@ -360,12 +390,46 @@ class RasScraper:
         logger.debug("Listings collected: %d (limit=%d)", len(out), limit)
         return out
 
+    async def collect_listings_fast(self, page: Page, q: RasQuery, limit: int = 100, wait_after_ms: int = 3000) -> List[RasListingItem]:
+        """Faster variant for stage-1: rely only on XHR JSON, skip DOM/API fallbacks.
+        Minimizes waits so we can close the browser quickly after collecting links.
+        """
+        logger = logging.getLogger(__name__)
+        bucket = await self._intercept_json(page, self._predicate)
+        await self.apply_filters(page, q)
+        try:
+            exists = await page.evaluate("() => typeof doSearchRequest === 'function'")
+            if exists:
+                await page.evaluate("() => doSearchRequest(1, false)")
+        except Exception:
+            pass
+        # Short, bounded wait for network/JSON to arrive
+        try:
+            await page.wait_for_load_state("networkidle", timeout=wait_after_ms)
+        except Exception:
+            pass
+        await asyncio.sleep(min(2.0, wait_after_ms / 1000.0))
+        items = self._parse_list_json(bucket)
+        # Truncate
+        out = []
+        seen = set()
+        for it in items:
+            key = (it.case_number or it.act_id or it.title, it.detail_url or it.download_url)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+            if len(out) >= limit:
+                break
+        logger.debug("FAST listings collected: %d (limit=%d)", len(out), limit)
+        return out
+
     @async_retryable(max_attempts=4)
     async def resolve_download_url(self, page: Page, detail_url: str) -> str | None:
         """Open detail page and try to discover a direct document download link.
-        Strategies:
-          1) Intercept JSON/XHR while the page loads and scrape link from response.
-          2) Look for anchor tags with .pdf or known download buttons in DOM.
+        Strict PDF-only policy:
+          1) Intercept JSON/XHR while the page loads; accept only direct .pdf or known PDF endpoints.
+          2) Look for anchor tags that clearly point to PDF URLs only.
         """
         logger = logging.getLogger(__name__)
         bucket = await self._intercept_json(page, lambda u: any(x in u for x in ["/Download", ".pdf", "/Document"]))
@@ -385,8 +449,8 @@ class RasScraper:
                         logger.debug("Resolved PDF via XHR for %s: %s", detail_url, v)
                         return v
 
-        # Try DOM anchors
-        links = await page.query_selector_all("a[href$='.pdf'], a[href*='download']")
+        # Try DOM anchors (strict PDF-only selectors)
+        links = await page.query_selector_all("a[href$='.pdf'], a[href*='/Document/Pdf/'], a[href*='/Kad/PdfDocument/']")
         for a in links:
             href = await a.get_attribute("href")
             if href:
@@ -395,23 +459,10 @@ class RasScraper:
                 logger.debug("Resolved PDF via DOM for %s: %s", detail_url, href)
                 return href
 
-        # Heuristic fallback: HtmlDocument route supports '?download=true'
-        try:
-            if "/Ras/HtmlDocument/" in detail_url:
-                fallback = detail_url
-                if not fallback.startswith("http"):
-                    fallback = self.BASE + fallback
-                if not fallback.endswith("?download=true"):
-                    fallback = fallback + ("&download=true" if "?" in fallback else "?download=true")
-                logger.debug("Resolved PDF via fallback for %s: %s", detail_url, fallback)
-                return fallback
-        except Exception:
-            pass
-
         logger.debug("No download URL resolved for %s", detail_url)
         return None
 
-    async def enrich_with_downloads(self, page: Page, items: List[RasListingItem], max_items: int = 25) -> List[RasListingItem]:
+    async def enrich_with_downloads(self, page: Page, items: List[RasListingItem], max_items: int = 50) -> List[RasListingItem]:
         out: List[RasListingItem] = []
         for it in items[:max_items]:
             if it.detail_url and not it.download_url:

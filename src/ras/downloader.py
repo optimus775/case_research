@@ -35,43 +35,71 @@ class RasDownloader:
         }
         if self.user_agent:
             h["User-Agent"] = self.user_agent
-        if self.cookies_header:
-            h["Cookie"] = self.cookies_header
+        # Do not set raw Cookie header here; let httpx CookieJar manage cookies
         if referer:
             h["Referer"] = referer
         return h
 
-    @async_retryable(max_attempts=5)
-    async def fetch_pdf(self, url: str, referer: Optional[str] = None, timeout_s: float = 90.0) -> bytes:
+    @async_retryable(max_attempts=3)
+    async def fetch_pdf(self, url: str, referer: Optional[str] = None, timeout_s: float = 60.0) -> tuple[bytes, str]:
         logger = logging.getLogger(__name__)
-        logger.debug("Fetching PDF: %s (referer=%s)", url, referer)
-        # Prefer Playwright bound request if provided (shares cookies/session)
+        logger.debug("Fetching PDF (strict): %s (referer=%s)", url, referer)
+        # Strict PDF-only policy: accept only direct PDF endpoints
+        u = (url or "").lower()
+        if not (u.endswith(".pdf") or "/document/pdf/" in u or "/kad/pdfdocument/" in u):
+            raise Exception(f"Non-PDF URL rejected by strict policy: {url}")
+        # First try via Playwright's request API (shares browser cookies/session)
         if self.page is not None:
-            resp = await self.page.request.get(url, headers=self._headers(referer))
-            ct = resp.headers.get("content-type", "")
-            content = await resp.body()
-            if not resp.ok:
-                raise Exception(f"Playwright fetch failed: {resp.status}")
-            if ("application/pdf" not in ct) and not content.startswith(b"%PDF"):
-                # Likely captcha/HTML
-                raise Exception(f"Unexpected content ({ct}) while fetching PDF")
-            logger.debug("Fetched PDF via Playwright: %d bytes from %s", len(content), url)
-            return content
-        # Fallback to httpx
+            try:
+                resp = await self.page.request.get(url, headers=self._headers(referer))
+                ct = (resp.headers.get("content-type", "") or "").lower()
+                content = await resp.body()
+                if ("application/pdf" in ct) or content.startswith(b"%PDF"):
+                    logger.debug("Fetched PDF via Playwright request: %d bytes", len(content))
+                    return content, url
+                else:
+                    logger.debug("Playwright request returned non-PDF (ct=%s); falling back to httpx", ct)
+            except Exception as e:
+                logger.debug("Playwright request path failed: %s; falling back to httpx", e)
+
+        # Fetch via httpx with cookie jar and ddos-guard handling
         transport = httpx.AsyncHTTPTransport(proxy=self.http_proxy) if self.http_proxy else httpx.AsyncHTTPTransport()
+        # Prepare cookie jar and pre-seed cookies from Playwright context if provided
+        cookies = httpx.Cookies()
+        if self.cookies_header:
+            try:
+                for part in self.cookies_header.split(";"):
+                    part = part.strip()
+                    if not part or "=" not in part:
+                        continue
+                    name, value = part.split("=", 1)
+                    # Scope cookies to arbitr.ru
+                    cookies.set(name.strip(), value.strip(), domain=".arbitr.ru", path="/")
+            except Exception:
+                pass
         async with httpx.AsyncClient(
             timeout=timeout_s,
             http2=True,
             follow_redirects=True,
             transport=transport,
+            cookies=cookies,
         ) as client:
-            r = await client.get(url, headers=self._headers(referer))
+            # First request may hit ddos-guard gate; allow one extra pass if HTML
+            headers = self._headers(referer)
+            r = await client.get(url, headers=headers)
             r.raise_for_status()
-            ct = r.headers.get("content-type", "")
+            ct = (r.headers.get("content-type", "") or "").lower()
+            if ("application/pdf" not in ct) and not r.content.startswith(b"%PDF"):
+                # If server is ddos-guard and returned small HTML, retry once to pass the gate
+                if ("ddos-guard" in (" ".join([k.decode().lower()+":"+v.decode().lower() for k,v in r.headers.raw])) or "text/html" in ct) and len(r.content) < 8192:
+                    logger.debug("Non-PDF response (likely ddos-guard). Repeating request after cookies.")
+                    r = await client.get(url, headers=headers)
+                    r.raise_for_status()
+                    ct = (r.headers.get("content-type", "") or "").lower()
             if ("application/pdf" not in ct) and not r.content.startswith(b"%PDF"):
                 raise Exception(f"Unexpected content-type for PDF: {ct}")
             logger.debug("Fetched PDF bytes: %d from %s", len(r.content), url)
-            return r.content
+            return r.content, url
 
     async def extract_text(self, pdf_bytes: bytes) -> str:
         text = ""
@@ -91,18 +119,13 @@ class RasDownloader:
         logger = logging.getLogger(__name__)
         if not item.download_url and not item.detail_url:
             return None
+        # Strict: only use direct PDF links discovered earlier
         url = item.download_url
-        if not url and item.detail_url:
-            # Fallback for HtmlDocument route: append ?download=true
-            if "/Ras/HtmlDocument/" in item.detail_url:
-                base = item.detail_url
-                if not base.startswith("http"):
-                    base = "https://ras.arbitr.ru" + base
-                url = base + ("&download=true" if "?" in base else "?download=true")
         if not url:
+            logger.debug("Skipping item without direct PDF URL (detail=%s, case=%s)", item.detail_url, item.case_number)
             return None
-        pdf = await self.fetch_pdf(url, referer=item.detail_url)
-        text = await self.extract_text(pdf)
+        pdf_bytes, final_url = await self.fetch_pdf(url, referer=item.detail_url)
+        text = await self.extract_text(pdf_bytes)
         saved_path = None
         if self.save_pdfs:
             try:
@@ -117,12 +140,12 @@ class RasDownloader:
                 while final_path.exists():
                     final_path = out_path.with_name(out_path.stem + f"_{i}" + out_path.suffix)
                     i += 1
-                final_path.write_bytes(pdf)
+                final_path.write_bytes(pdf_bytes)
                 saved_path = str(final_path)
                 logger.debug("Saved PDF to %s", saved_path)
             except Exception as e:
                 logger.warning("Failed saving PDF: %s", e)
-        logger.debug("Parsed PDF for case %s: %d bytes, text_len=%d", item.case_number, len(pdf), len(text))
+        logger.debug("Parsed PDF for case %s: %d bytes, text_len=%d", item.case_number, len(pdf_bytes), len(text))
         return RasRawDoc(
             listing_id=item.act_id or item.case_id,
             case_number=item.case_number,
@@ -131,7 +154,7 @@ class RasDownloader:
             court=item.court,
             source_url=item.detail_url,
             filename=(Path(saved_path).name if saved_path else (item.title or "document.pdf")),
-            bytes_len=len(pdf),
+            bytes_len=len(pdf_bytes),
             text=text,
-            meta={"download_url": url, "saved_path": saved_path} if saved_path else {"download_url": url},
+            meta={"download_url": final_url, "saved_path": saved_path} if saved_path else {"download_url": final_url},
         )

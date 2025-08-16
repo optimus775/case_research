@@ -61,7 +61,19 @@ class RasBrowser:
         chrome_channel = os.getenv("RAS_CHROME_CHANNEL")
         if chrome_channel:
             launch_args["channel"] = chrome_channel
-        self._browser = await self._pw.chromium.launch(**launch_args)
+        try:
+            self._browser = await self._pw.chromium.launch(**launch_args)
+        except Exception as e:
+            msg = str(e).lower()
+            if chrome_channel and ("distribution" in msg or "not found" in msg):
+                # Fallback: Chrome channel is unavailable on this OS; retry without channel
+                logging.getLogger(__name__).warning(
+                    "Chrome channel '%s' not available; falling back to default Chromium", chrome_channel
+                )
+                launch_args.pop("channel", None)
+                self._browser = await self._pw.chromium.launch(**launch_args)
+            else:
+                raise
         logging.getLogger(__name__).debug("Chromium launched")
         return self
 
@@ -78,6 +90,7 @@ class RasBrowser:
             locale="ru-RU",
             user_agent=ua,
             viewport={"width": 1400, "height": 900},
+            accept_downloads=True,
         )
         page = await context.new_page()
         page.set_default_navigation_timeout(60000)
